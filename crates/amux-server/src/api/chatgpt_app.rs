@@ -58,16 +58,22 @@
 //!    at once, through the same approval the owner's Settings click uses, and
 //!    the browser is redirected straight to the client with `code`, `state`
 //!    and `iss`. A member's approval binds the grant to that member (id, email,
-//!    scope, team). "Verified member" means the markers the outermost
+//!    scope, team). A member or owner session approves silently, so it does so
+//!    ONLY for a same-device callback (`same_device_callback`: loopback, or
+//!    Claude's desktop scheme): the code must come back to the device that is
+//!    signed in, not to a remote client (ChatGPT, the cloud front door,
+//!    `AMUX_MCP_REDIRECT_ALLOW`) we would have to trust to bind `state` to
+//!    this browser. Those wait for the owner's code (`remote_callback`). The
+//!    explicit owner bearer is not silent and approves any allowed callback. "Verified member" means the markers the outermost
 //!    `org::local_member_identity` layer writes after checking the
 //!    `amux_member` cookie (or a tailnet login) against the database; it
 //!    strips inbound copies, so a client cannot assert them. Loopback earns
 //!    nothing: a relayed request without one of these credentials stays
 //!    pending like any other.
 //! 3. Otherwise the page shows a short code, plus a "Sign in" button to
-//!    `/sso/login?next=<this authorize URL>` when SSO is configured and the
-//!    request did not come through the tunnel relay (which does not forward
-//!    `/sso/*`). After sign-in the browser returns here and step 2 approves.
+//!    `/sso/login?next=<this authorize URL>` when SSO is configured, the
+//!    callback is same-device, and the request did not come through the
+//!    tunnel relay (which does not forward `/sso/*`). After sign-in the browser returns here and step 2 approves.
 //!    The owner can still approve the code in Settings > ChatGPT, the
 //!    break-glass path: the page polls `/oauth/authorize/status` with a secret
 //!    only it holds, receives the one-time code, and redirects to the client.
@@ -163,6 +169,25 @@ pub(crate) fn redirect_allowed(uri: &str, extra: &str) -> bool {
         .filter(|p| p.starts_with("https://") && p.len() > "https://x/".len())
         .any(|p| uri.starts_with(p));
     chatgpt || loopback || front_door || claude_desktop || listed
+}
+
+/// True when the client's callback hands the code back to the same device the
+/// browser runs on: a loopback listener, or Claude's desktop app scheme (exact
+/// match). Only then may the authorize page approve without the owner's code
+/// or bearer; a remote callback (ChatGPT, the cloud front door, anything in
+/// `AMUX_MCP_REDIRECT_ALLOW`) would make us trust that remote client to bind
+/// `state` to this browser.
+pub(crate) fn same_device_callback(uri: &str) -> bool {
+    if CLAUDE_DESKTOP_CALLBACKS.contains(&uri) {
+        return true;
+    }
+    let Ok(u) = reqwest::Url::parse(uri) else {
+        return false;
+    };
+    u.fragment().is_none()
+        && u.username().is_empty()
+        && u.scheme() == "http"
+        && matches!(u.host_str().unwrap_or(""), "localhost" | "127.0.0.1" | "[::1]")
 }
 
 fn extra_redirects() -> String {
@@ -766,12 +791,20 @@ async fn authorize(State(state): State<AppState>, headers: HeaderMap, uri: Uri, 
     // A verified member or the owner approves their own request here, through
     // the same approval the owner's Settings click uses, and the browser goes
     // straight back to the client with the code. Nothing else does.
+    // Silent approval (a member or the owner's session) only when the code
+    // comes back to this same device; an explicit owner bearer may approve
+    // any allowed callback.
+    let same_device = same_device_callback(&redirect_uri);
     let owner_session_valid = super::static_files::owner_session_status(&state, &headers) == "valid";
-    match auto_approval(&headers, &uri, state.auth_token.as_deref(), owner_session_valid) {
+    let approval = match auto_approval(&headers, &uri, state.auth_token.as_deref(), owner_session_valid) {
+        Ok(who) if who.silent() && !same_device => Err("remote_callback"),
+        other => other,
+    };
+    match approval {
         Ok(who) => {
             let member = match who {
                 AutoApproval::Member(m) => Some(m),
-                AutoApproval::Owner => None,
+                AutoApproval::OwnerBearer | AutoApproval::OwnerSession => None,
             };
             let (id2, ps2, m2) = (id.clone(), poll_secret.clone(), member.clone());
             let minted = write_ret(&state, move |c| {
@@ -833,8 +866,10 @@ async fn authorize(State(state): State<AppState>, headers: HeaderMap, uri: Uri, 
         return r;
     }
     // The relay forwards only the OAuth and /mcp paths, so a sign-in link is
-    // offered only where the browser reaches amux directly.
-    let sign_in = (super::sso::configured() && headers.get(RELAY_HEADER).is_none()).then(|| sso_sign_in_link(q.as_deref()));
+    // offered only where the browser reaches amux directly, and only for a
+    // same-device callback, the only kind a member's sign-in can approve.
+    let sign_in = (super::sso::configured() && headers.get(RELAY_HEADER).is_none() && same_device)
+        .then(|| sso_sign_in_link(q.as_deref()));
     let body = pending_body(&client_name, &scope, &user_code, &id, &poll_secret, sign_in.as_deref());
     html_page("Approve amux connection", &body)
 }
@@ -879,8 +914,19 @@ pub(crate) fn sso_sign_in_link(query: Option<&str>) -> String {
 
 /// Who may approve a request from the authorize page itself.
 pub(crate) enum AutoApproval {
-    Owner,
+    /// The owner token, presented explicitly (`Authorization: Bearer`).
+    OwnerBearer,
+    /// The owner's dashboard session cookie: silent, like a member's.
+    OwnerSession,
     Member(GrantMember),
+}
+
+impl AutoApproval {
+    /// Approval the browser gives without anyone typing or clicking. Only an
+    /// explicit owner bearer is not silent.
+    fn silent(&self) -> bool {
+        !matches!(self, AutoApproval::OwnerBearer)
+    }
 }
 
 /// Pure, so the tests pin it. `Err("no_identity")` is the ordinary case (the
@@ -906,13 +952,13 @@ pub(crate) fn auto_approval(headers: &HeaderMap, uri: &Uri, owner_token: Option<
         super::auth::provided_owner_token(headers, uri).is_some_and(|t| super::auth::constant_time_eq(t.as_bytes(), exp.as_bytes()))
     });
     if owner_token_ok {
-        return Ok(AutoApproval::Owner);
+        return Ok(AutoApproval::OwnerBearer);
     }
     if super::org::is_verified_local_member(headers) {
         return GrantMember::from_verified_headers(headers).map(AutoApproval::Member).ok_or("member_identity_incomplete");
     }
     if owner_session_valid {
-        return Ok(AutoApproval::Owner);
+        return Ok(AutoApproval::OwnerSession);
     }
     Err("no_identity")
 }
@@ -1794,6 +1840,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     const CB: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
+    /// A same-device callback: the only kind silent approval answers.
+    const LOCAL_CB: &str = "http://localhost:6274/oauth/callback";
 
     async fn raw(app: &Router, req: Request<Body>) -> (StatusCode, HeaderMap, String) {
         let r = app.clone().oneshot(req).await.unwrap();
@@ -1826,16 +1874,16 @@ mod tests {
         h["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string()
     }
 
-    async fn register_client(a: &Router) -> String {
+    async fn register_client(a: &Router, cb: &str) -> String {
         let (s, _, body) = raw(a, Request::post("/oauth/register").header("host", "amux.test").header("content-type", "application/json")
-            .body(Body::from(json!({"client_name": "ChatGPT", "redirect_uris": [CB]}).to_string())).unwrap()).await;
+            .body(Body::from(json!({"client_name": "ChatGPT", "redirect_uris": [cb]}).to_string())).unwrap()).await;
         assert_eq!(s, StatusCode::CREATED, "{body}");
         serde_json::from_str::<Value>(&body).unwrap()["client_id"].as_str().unwrap().to_string()
     }
 
-    fn authorize_path(cid: &str) -> String {
+    fn authorize_path(cid: &str, cb: &str) -> String {
         format!("/oauth/authorize?response_type=code&client_id={cid}&redirect_uri={}&code_challenge={CHALLENGE}&code_challenge_method=S256&state=xyz",
-            enc(CB))
+            enc(cb))
     }
 
     fn approved_count(st: &AppState) -> i64 {
@@ -1843,11 +1891,11 @@ mod tests {
         c.query_row("SELECT COUNT(*) FROM chatgpt_oauth_requests WHERE status='approved'", [], |r| r.get(0)).unwrap()
     }
 
-    async fn redeem(a: &Router, cid: &str, location: &str) -> String {
-        assert!(location.starts_with(&format!("{CB}?code=")), "{location}");
+    async fn redeem(a: &Router, cid: &str, cb: &str, location: &str) -> String {
+        assert!(location.starts_with(&format!("{cb}?code=")), "{location}");
         assert!(location.contains("state=xyz") && location.contains("iss=https%3A%2F%2Famux.test"), "{location}");
         let code = location.split("code=").nth(1).unwrap().split('&').next().unwrap();
-        let form = format!("grant_type=authorization_code&code={code}&client_id={cid}&redirect_uri={}&code_verifier={VERIFIER}", enc(CB));
+        let form = format!("grant_type=authorization_code&code={code}&client_id={cid}&redirect_uri={}&code_verifier={VERIFIER}", enc(cb));
         let (s, _, body) = raw(a, Request::post("/oauth/token").header("host", "amux.test")
             .header("content-type", "application/x-www-form-urlencoded").body(Body::from(form)).unwrap()).await;
         assert_eq!(s, StatusCode::OK, "{body}");
@@ -1867,12 +1915,12 @@ mod tests {
         let (d, st) = state();
         let a = crate::api::router(st.clone());
         let cookie = signed_in_member(d.path(), &a, "ann@example.com").await;
-        let cid = register_client(&a).await;
+        let cid = register_client(&a, LOCAL_CB).await;
 
-        let (s, h, body) = raw(&a, Request::get(authorize_path(&cid)).header("host", "amux.test").header("cookie", &cookie)
+        let (s, h, body) = raw(&a, Request::get(authorize_path(&cid, LOCAL_CB)).header("host", "amux.test").header("cookie", &cookie)
             .body(Body::empty()).unwrap()).await;
         assert_eq!(s, StatusCode::FOUND, "a verified member is not asked for the owner's code: {body}");
-        let at = redeem(&a, &cid, h["location"].to_str().unwrap()).await;
+        let at = redeem(&a, &cid, LOCAL_CB, h["location"].to_str().unwrap()).await;
 
         let b = bearer_of(&st, &at);
         let m = b.member.clone().expect("the grant is bound to the member");
@@ -1907,8 +1955,8 @@ mod tests {
     async fn no_identity_gets_the_code_page_and_stays_pending_even_from_loopback() {
         let (_d, st) = state();
         let a = crate::api::router(st.clone());
-        let cid = register_client(&a).await;
-        let mut req = Request::get(authorize_path(&cid)).header("host", "amux.test").header(RELAY_HEADER, "1").body(Body::empty()).unwrap();
+        let cid = register_client(&a, LOCAL_CB).await;
+        let mut req = Request::get(authorize_path(&cid, LOCAL_CB)).header("host", "amux.test").header(RELAY_HEADER, "1").body(Body::empty()).unwrap();
         req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5555))));
         let (s, _, page) = raw(&a, req).await;
         assert_eq!(s, StatusCode::OK);
@@ -1942,8 +1990,8 @@ mod tests {
     async fn forged_member_headers_approve_nothing() {
         let (_d, st) = state();
         let a = crate::api::router(st.clone());
-        let cid = register_client(&a).await;
-        let mut req = Request::get(authorize_path(&cid)).header("host", "amux.test").body(Body::empty()).unwrap();
+        let cid = register_client(&a, LOCAL_CB).await;
+        let mut req = Request::get(authorize_path(&cid, LOCAL_CB)).header("host", "amux.test").body(Body::empty()).unwrap();
         for (k, v) in crate::api::org::test_member_headers("mallory@example.com", true).iter() {
             req.headers_mut().insert(k.clone(), v.clone());
         }
@@ -1960,13 +2008,13 @@ mod tests {
         let (d, st) = state();
         let a = crate::api::router(st.clone());
         let cookie = signed_in_member(d.path(), &a, "bob@example.com").await;
-        let cid = register_client(&a).await;
+        let cid = register_client(&a, LOCAL_CB).await;
         for (k, v) in [("x-amux-worker", "w1"), ("x-amux-session", "w1")] {
-            let (s, _, page) = raw(&a, Request::get(authorize_path(&cid)).header("host", "amux.test").header("cookie", &cookie)
+            let (s, _, page) = raw(&a, Request::get(authorize_path(&cid, LOCAL_CB)).header("host", "amux.test").header("cookie", &cookie)
                 .header(k, v).body(Body::empty()).unwrap()).await;
             assert_eq!(s, StatusCode::OK, "{k}: {page}");
         }
-        let (s, _, _) = raw(&a, Request::get(authorize_path(&cid)).header("host", "amux.test")
+        let (s, _, _) = raw(&a, Request::get(authorize_path(&cid, LOCAL_CB)).header("host", "amux.test")
             .header("authorization", "Bearer owner-tok").header("x-amux-session", "amux").body(Body::empty()).unwrap()).await;
         assert_eq!(s, StatusCode::OK, "the owner token in a worker's hands approves nothing here");
         assert_eq!(approved_count(&st), 0);
@@ -1984,8 +2032,8 @@ mod tests {
         assert_eq!(auto_approval(&worker, &uri, Some("tok"), false).err(), Some("worker_origin"));
         assert_eq!(auto_approval(&hdrs(&[(RELAY_HEADER, "1")]), &uri, Some("tok"), false).err(), Some("no_identity"));
         assert_eq!(auto_approval(&hdrs(&[("authorization", "Bearer nope")]), &uri, Some("tok"), false).err(), Some("no_identity"));
-        assert!(matches!(auto_approval(&hdrs(&[("authorization", "Bearer tok")]), &uri, Some("tok"), false), Ok(AutoApproval::Owner)));
-        assert!(matches!(auto_approval(&hdrs(&[(RELAY_HEADER, "1")]), &uri, None, true), Ok(AutoApproval::Owner)));
+        assert!(matches!(auto_approval(&hdrs(&[("authorization", "Bearer tok")]), &uri, Some("tok"), false), Ok(AutoApproval::OwnerBearer)));
+        assert!(matches!(auto_approval(&hdrs(&[(RELAY_HEADER, "1")]), &uri, None, true), Ok(AutoApproval::OwnerSession)));
         assert_eq!(auto_approval(&hdrs(&[("x-amux-worker", "w")]), &uri, Some("tok"), true).err(), Some("worker_origin"));
     }
 
@@ -1995,14 +2043,14 @@ mod tests {
     async fn the_owner_approves_directly_or_by_code() {
         let (_d, st) = state();
         let a = crate::api::router(st.clone());
-        let cid = register_client(&a).await;
-        let (s, h, body) = raw(&a, Request::get(authorize_path(&cid)).header("host", "amux.test")
+        let cid = register_client(&a, CB).await;
+        let (s, h, body) = raw(&a, Request::get(authorize_path(&cid, CB)).header("host", "amux.test")
             .header("authorization", "Bearer owner-tok").body(Body::empty()).unwrap()).await;
-        assert_eq!(s, StatusCode::FOUND, "{body}");
-        let at = redeem(&a, &cid, h["location"].to_str().unwrap()).await;
+        assert_eq!(s, StatusCode::FOUND, "an explicit owner bearer may approve a remote callback: {body}");
+        let at = redeem(&a, &cid, CB, h["location"].to_str().unwrap()).await;
         assert!(bearer_of(&st, &at).member.is_none(), "an owner grant carries no member");
 
-        let (s, _, page) = raw(&a, Request::get(authorize_path(&cid)).header("host", "amux.test").body(Body::empty()).unwrap()).await;
+        let (s, _, page) = raw(&a, Request::get(authorize_path(&cid, CB)).header("host", "amux.test").body(Body::empty()).unwrap()).await;
         assert_eq!(s, StatusCode::OK);
         let id = page.split("status?id=").nth(1).unwrap().split('&').next().unwrap().to_string();
         let k = page.split("&k=").nth(1).unwrap().split('\'').next().unwrap().to_string();
@@ -2010,7 +2058,65 @@ mod tests {
             .body(Body::empty()).unwrap()).await;
         assert_eq!(s, StatusCode::OK, "{body}");
         let (_, _, p) = call(&a, Request::get(format!("/oauth/authorize/status?id={id}&k={k}")).header("host", "amux.test").body(Body::empty()).unwrap()).await;
-        let at = redeem(&a, &cid, p["redirect"].as_str().unwrap()).await;
+        let at = redeem(&a, &cid, CB, p["redirect"].as_str().unwrap()).await;
         assert!(bearer_of(&st, &at).member.is_none());
+    }
+
+    /// The owner's dashboard session approves silently, so only a same-device
+    /// callback; for a remote one it waits for the code like anyone else.
+    #[tokio::test]
+    async fn the_owner_session_approves_only_a_same_device_callback() {
+        let (_d, st) = state();
+        let a = crate::api::router(st.clone());
+        let session = hex::encode(Sha256::digest(b"amux-owner-session:owner-tok"));
+        let cookie = format!("__Host-amux_owner={session}");
+        let cid = register_client(&a, LOCAL_CB).await;
+        let (s, h, body) = raw(&a, Request::get(authorize_path(&cid, LOCAL_CB)).header("host", "amux.test").header("cookie", &cookie)
+            .body(Body::empty()).unwrap()).await;
+        assert_eq!(s, StatusCode::FOUND, "{body}");
+        let at = redeem(&a, &cid, LOCAL_CB, h["location"].to_str().unwrap()).await;
+        assert!(bearer_of(&st, &at).member.is_none());
+
+        let cid = register_client(&a, CB).await;
+        let (s, _, page) = raw(&a, Request::get(authorize_path(&cid, CB)).header("host", "amux.test").header("cookie", &cookie)
+            .body(Body::empty()).unwrap()).await;
+        assert_eq!(s, StatusCode::OK, "{page}");
+        assert!(page.contains("Approve in amux"));
+    }
+
+    /// A verified member with a remote callback (ChatGPT) is not approved
+    /// silently: the request stays pending for the owner's code, and the page
+    /// offers no sign-in (it could not approve anything).
+    #[tokio::test]
+    async fn a_member_with_a_remote_callback_waits_for_the_owner() {
+        let (d, st) = state();
+        let a = crate::api::router(st.clone());
+        let cookie = signed_in_member(d.path(), &a, "cy@example.com").await;
+        let cid = register_client(&a, CB).await;
+        let (s, _, page) = raw(&a, Request::get(authorize_path(&cid, CB)).header("host", "amux.test").header("cookie", &cookie)
+            .body(Body::empty()).unwrap()).await;
+        assert_eq!(s, StatusCode::OK, "{page}");
+        assert!(page.contains("Approve in amux") && !page.contains("/sso/login"), "{page}");
+        let id = page.split("status?id=").nth(1).unwrap().split('&').next().unwrap().to_string();
+        let k = page.split("&k=").nth(1).unwrap().split('\'').next().unwrap().to_string();
+        let (_, _, p) = call(&a, Request::get(format!("/oauth/authorize/status?id={id}&k={k}")).header("host", "amux.test").body(Body::empty()).unwrap()).await;
+        assert_eq!(p["status"], "pending");
+        assert_eq!(approved_count(&st), 0);
+    }
+
+    #[test]
+    fn same_device_callbacks_are_loopback_and_the_claude_desktop_scheme_only() {
+        assert!(same_device_callback("http://localhost:6274/oauth/callback"));
+        assert!(same_device_callback("http://127.0.0.1/cb"));
+        assert!(same_device_callback("http://[::1]:9000/cb"));
+        assert!(same_device_callback("claude://claude.ai/mcp-auth-callback"));
+        assert!(same_device_callback("claude://claude.ai/mcp-auth-callback/sdk"));
+        assert!(!same_device_callback("claude://claude.ai/mcp-auth-callback/sdk/x"));
+        assert!(!same_device_callback("claude://evil.io/mcp-auth-callback"));
+        assert!(!same_device_callback("https://chatgpt.com/connector_platform_oauth_redirect"));
+        assert!(!same_device_callback(FRONT_DOOR_CALLBACK));
+        assert!(!same_device_callback("http://evil.io/cb"));
+        assert!(!same_device_callback("https://localhost/cb"));
+        assert!(!same_device_callback("http://user@localhost/cb"));
     }
 }
