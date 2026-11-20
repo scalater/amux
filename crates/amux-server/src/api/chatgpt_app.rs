@@ -70,6 +70,14 @@ const RELAY_HEADER: &str = "x-amux-tunnel-relay";
 const PUBLIC_BASE_HEADER: &str = "x-amux-public-base";
 /// The cloud front door's workspace callback (see `redirect_allowed`).
 pub(crate) const FRONT_DOOR_CALLBACK: &str = "https://cloud.amux.io/oauth/workspace/callback";
+/// Claude's desktop app (Code tab and chat) completes MCP OAuth through its own
+/// URL scheme instead of a loopback listener. Exact matches only: the scheme
+/// is registered by the app, and PKCE plus the owner's code approval still
+/// gate every grant.
+pub(crate) const CLAUDE_DESKTOP_CALLBACKS: &[&str] = &[
+    "claude://claude.ai/mcp-auth-callback",
+    "claude://claude.ai/mcp-auth-callback/sdk",
+];
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -121,12 +129,13 @@ pub(crate) fn redirect_allowed(uri: &str, extra: &str) -> bool {
     // on that host. It lets one directory listing reach every user's own
     // amux; the owner still approves the code here.
     let front_door = uri == FRONT_DOOR_CALLBACK;
+    let claude_desktop = CLAUDE_DESKTOP_CALLBACKS.contains(&uri);
     let listed = extra
         .split(',')
         .map(str::trim)
         .filter(|p| p.starts_with("https://") && p.len() > "https://x/".len())
         .any(|p| uri.starts_with(p));
-    chatgpt || loopback || front_door || listed
+    chatgpt || loopback || front_door || claude_desktop || listed
 }
 
 fn extra_redirects() -> String {
@@ -1236,6 +1245,11 @@ mod tests {
         assert!(redirect_allowed("https://claude.ai/api/mcp/auth_callback", "https://claude.ai/api/mcp/"));
         // The cloud front door's callback, exactly: not its host, not a prefix.
         assert!(redirect_allowed(FRONT_DOOR_CALLBACK, ""));
+        assert!(redirect_allowed("claude://claude.ai/mcp-auth-callback", ""));
+        assert!(redirect_allowed("claude://claude.ai/mcp-auth-callback/sdk", ""));
+        assert!(!redirect_allowed("claude://claude.ai/mcp-auth-callback/sdk/x", ""));
+        assert!(!redirect_allowed("claude://evil.io/mcp-auth-callback", ""));
+        assert!(!redirect_allowed("claude://claude.ai/mcp-auth-callback#frag", ""));
         assert!(!redirect_allowed("https://cloud.amux.io/oauth/workspace/callback/x", ""));
         assert!(!redirect_allowed("https://cloud.amux.io/other", ""));
         assert!(!redirect_allowed("http://cloud.amux.io/oauth/workspace/callback", ""));
