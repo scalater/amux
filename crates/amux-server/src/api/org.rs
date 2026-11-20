@@ -620,6 +620,35 @@ pub(crate) fn has_local_member_cookie(headers: &HeaderMap) -> bool {
     member_cookie(headers).is_some()
 }
 
+/// The `Cookie` value that presents a member session, for an INTERNAL loopback
+/// call made with that member's own credential (chatgpt_app.rs). The call goes
+/// through [`local_member_identity`] like any browser request, so the member's
+/// scope, second-factor and SSO rules apply to it unchanged.
+pub(crate) fn member_cookie_pair(token: &str) -> String {
+    format!("{MEMBER_COOKIE}={token}")
+}
+
+/// The newest session of this member that [`local_member_identity`] would
+/// still accept: a used invite row of the same member (id AND email), and for
+/// an SSO session one that has not expired (`now` in epoch seconds). `None`
+/// once the member is deleted or their email changed, or every session ended.
+pub(crate) fn live_member_session(
+    conn: &rusqlite::Connection,
+    member_id: &str,
+    email: &str,
+    now: i64,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT i.token FROM org_invites i JOIN org_members m ON m.id=i.used_by \
+         WHERE m.id=?1 AND lower(m.email)=lower(?2) AND i.used_at IS NOT NULL \
+           AND (COALESCE(i.via,'invite')<>'sso' OR i.expires_at > ?3) \
+         ORDER BY i.used_at DESC LIMIT 1",
+        rusqlite::params![member_id, email, now],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+}
+
 /// Resolve a local invitee before auth and before the request logger.
 ///
 /// A used invite is the durable session capability. Joining through

@@ -1,0 +1,12 @@
+-- MCP connections approved by a team member (chatgpt_app.rs). A request that
+-- the authorize page approved for a verified member is bound to that member:
+-- the grant IS the request row, so every token minted under it resolves to
+-- the same person, and its tool calls run with that member's own session and
+-- scope instead of the owner's. NULL on every column means an owner grant
+-- (approved with the owner's code, session or bearer), which is every row made
+-- before this migration.
+-- ADDCOL: chatgpt_oauth_requests member_id TEXT
+-- ADDCOL: chatgpt_oauth_requests member_email TEXT
+-- ADDCOL: chatgpt_oauth_requests member_scope_level TEXT
+-- ADDCOL: chatgpt_oauth_requests member_scope_name TEXT
+-- ADDCOL: chatgpt_oauth_requests member_team_id TEXT

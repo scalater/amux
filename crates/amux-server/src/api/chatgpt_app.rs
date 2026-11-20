@@ -14,7 +14,16 @@
 //! `message_worker`, `add_card`, `update_card_status` (write). No tool
 //! deletes, kills, archives, or discards anything. A message from ChatGPT
 //! carries a server-written `[amux-origin: chatgpt ...]` stamp naming the
-//! grant, and never a worker header, so it cannot pass as a session.
+//! grant (and the member, for a member's grant), and never a worker header,
+//! so it cannot pass as a session.
+//!
+//! An owner grant calls the API with the owner token, as today. A grant bound
+//! to a team member calls it with that member's own live session instead (the
+//! `amux_member` cookie of their newest unexpired sign-in), so the member
+//! middleware verifies it like any browser request: member scope filters
+//! workers and cards, actions are attributed `member:<email>`, and SSO and
+//! second-factor rules apply. When the member is deleted or has no live
+//! session left, the tool call is refused; it never falls back to the owner.
 //!
 //! # The trust rule (why the loopback bypass is not enough here)
 //!
@@ -40,10 +49,28 @@
 //! # The connect flow
 //!
 //! ChatGPT registers (`/oauth/register`), sends the user to
-//! `/oauth/authorize`, which records a PENDING request and shows a short code.
-//! The owner approves that code in Settings > ChatGPT. The authorize page polls
-//! `/oauth/authorize/status` with a secret only that page holds, receives the
-//! one-time code, and redirects back to ChatGPT with `code`, `state` and `iss`.
+//! `/oauth/authorize`, which validates the request and records it PENDING.
+//! Then, in this order:
+//!
+//! 1. A worker origin (`x-amux-worker`, or an `x-amux-session` that is not the
+//!    one the member middleware itself wrote) never approves anything here.
+//! 2. The owner bearer, a verified member, or a valid owner session approves
+//!    at once, through the same approval the owner's Settings click uses, and
+//!    the browser is redirected straight to the client with `code`, `state`
+//!    and `iss`. A member's approval binds the grant to that member (id, email,
+//!    scope, team). "Verified member" means the markers the outermost
+//!    `org::local_member_identity` layer writes after checking the
+//!    `amux_member` cookie (or a tailnet login) against the database; it
+//!    strips inbound copies, so a client cannot assert them. Loopback earns
+//!    nothing: a relayed request without one of these credentials stays
+//!    pending like any other.
+//! 3. Otherwise the page shows a short code, plus a "Sign in" button to
+//!    `/sso/login?next=<this authorize URL>` when SSO is configured and the
+//!    request did not come through the tunnel relay (which does not forward
+//!    `/sso/*`). After sign-in the browser returns here and step 2 approves.
+//!    The owner can still approve the code in Settings > ChatGPT, the
+//!    break-glass path: the page polls `/oauth/authorize/status` with a secret
+//!    only it holds, receives the one-time code, and redirects to the client.
 //!
 //! Every refusal logs a `verdict` and every grant, revoke and tool call
 //! writes a line to `~/.amux/logs/chatgpt-app-audit.jsonl`.
@@ -286,6 +313,57 @@ pub(crate) fn db_decide(c: &Connection, id: &str, approve: bool, now: f64) -> ru
     Ok(n == 1)
 }
 
+/// The team member a grant is bound to, as the member middleware verified
+/// them when the grant was approved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GrantMember {
+    pub id: String,
+    pub email: String,
+    pub scope_level: String,
+    pub scope_name: String,
+    pub team_id: String,
+}
+
+impl GrantMember {
+    /// Only from the markers `org::local_member_identity` writes after it
+    /// verified the member against the database (inbound copies are stripped).
+    pub(crate) fn from_verified_headers(h: &HeaderMap) -> Option<Self> {
+        if !super::org::is_verified_local_member(h) {
+            return None;
+        }
+        let email = super::org::local_member_actor(h)?.strip_prefix("member:")?.trim().to_string();
+        let id = h.get("x-amux-user-id")?.to_str().ok()?.trim().to_string();
+        let scope = super::org::local_member_scope(h)?;
+        let team_id = super::org::local_member_team(h)
+            .and_then(|t| t.get("id").and_then(Value::as_str).map(String::from))
+            .unwrap_or_default();
+        (!email.is_empty() && !id.is_empty()).then(|| GrantMember {
+            id,
+            email,
+            scope_level: scope.level().to_string(),
+            scope_name: scope.name().to_string(),
+            team_id,
+        })
+    }
+}
+
+/// The one approval path: the owner's click in Settings (`member` None) and
+/// the authorize page approving its own request for a verified member or the
+/// owner. A member's approval binds the grant to that member in the same write.
+pub(crate) fn db_approve(c: &Connection, id: &str, member: Option<&GrantMember>, now: f64) -> rusqlite::Result<bool> {
+    if !db_decide(c, id, true, now)? {
+        return Ok(false);
+    }
+    if let Some(m) = member {
+        c.execute(
+            "UPDATE chatgpt_oauth_requests SET member_id=?2, member_email=?3, member_scope_level=?4,
+             member_scope_name=?5, member_team_id=?6 WHERE id=?1",
+            params![id, m.id, m.email, m.scope_level, m.scope_name, m.team_id],
+        )?;
+    }
+    Ok(true)
+}
+
 pub(crate) enum PollOutcome {
     Pending,
     Denied,
@@ -332,6 +410,8 @@ pub(crate) struct Issued {
     pub refresh: String,
     pub scope: String,
     pub grant_id: String,
+    /// The member the grant is bound to, for the audit line; None for the owner.
+    pub member: Option<String>,
 }
 
 fn insert_pair(c: &Connection, grant: &str, client: &str, scope: &str, resource: &str, now: f64) -> rusqlite::Result<Issued> {
@@ -344,7 +424,11 @@ fn insert_pair(c: &Connection, grant: &str, client: &str, scope: &str, resource:
             params![sha256_hex(tok), kind, grant, client, scope, resource, now, now + ttl],
         )?;
     }
-    Ok(Issued { access, refresh, scope: scope.to_string(), grant_id: grant.to_string() })
+    let member: Option<String> = c
+        .query_row("SELECT member_email FROM chatgpt_oauth_requests WHERE id=?1", [grant], |r| r.get::<_, Option<String>>(0))
+        .optional()?
+        .flatten();
+    Ok(Issued { access, refresh, scope: scope.to_string(), grant_id: grant.to_string(), member })
 }
 
 /// Authorization-code exchange. Every check runs inside the one write, and
@@ -435,18 +519,35 @@ pub(crate) struct Bearer {
     pub grant_id: String,
     pub client_id: String,
     pub scope: String,
+    /// The member this grant is bound to; None for an owner grant.
+    pub member: Option<GrantMember>,
 }
 
 pub(crate) fn db_check_access(c: &Connection, token: &str, resource: &str, now: f64) -> rusqlite::Result<Result<Bearer, &'static str>> {
-    let row: Option<(String, String, String, String, f64, Option<f64>)> = c
+    type AccessRow = (String, String, String, String, f64, Option<f64>, [Option<String>; 5]);
+    let row: Option<AccessRow> = c
         .query_row(
-            "SELECT grant_id, client_id, scope, resource, expires, revoked_at FROM chatgpt_oauth_tokens WHERE token_hash=?1 AND kind='access'",
+            "SELECT t.grant_id, t.client_id, t.scope, t.resource, t.expires, t.revoked_at,
+                    r.member_id, r.member_email, r.member_scope_level, r.member_scope_name, r.member_team_id
+             FROM chatgpt_oauth_tokens t LEFT JOIN chatgpt_oauth_requests r ON r.id=t.grant_id
+             WHERE t.token_hash=?1 AND t.kind='access'",
             [sha256_hex(token)],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
+                [r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?])),
         )
         .optional()?;
-    let Some((grant_id, client_id, scope, res, expires, revoked)) = row else {
+    let Some((grant_id, client_id, scope, res, expires, revoked, [m_id, m_email, m_level, m_name, m_team])) = row else {
         return Ok(Err("unknown_token"));
+    };
+    let member = match (m_id, m_email) {
+        (Some(id), Some(email)) if !id.is_empty() && !email.is_empty() => Some(GrantMember {
+            id,
+            email,
+            scope_level: m_level.unwrap_or_default(),
+            scope_name: m_name.unwrap_or_default(),
+            team_id: m_team.unwrap_or_default(),
+        }),
+        _ => None,
     };
     if revoked.is_some() {
         return Ok(Err("token_revoked"));
@@ -457,7 +558,7 @@ pub(crate) fn db_check_access(c: &Connection, token: &str, resource: &str, now: 
     if res != resource {
         return Ok(Err("audience_mismatch"));
     }
-    Ok(Ok(Bearer { grant_id, client_id, scope }))
+    Ok(Ok(Bearer { grant_id, client_id, scope, member }))
 }
 
 pub(crate) fn db_revoke_grant(c: &Connection, grant: &str, now: f64) -> rusqlite::Result<usize> {
@@ -467,7 +568,8 @@ pub(crate) fn db_revoke_grant(c: &Connection, grant: &str, now: f64) -> rusqlite
 
 fn db_list(c: &Connection, now: f64) -> rusqlite::Result<Vec<Value>> {
     let mut st = c.prepare(
-        "SELECT r.id, r.client_id, COALESCE(k.client_name,''), r.redirect_uri, r.scope, r.resource, r.status, r.user_code, r.created, r.decided_at, r.last_used
+        "SELECT r.id, r.client_id, COALESCE(k.client_name,''), r.redirect_uri, r.scope, r.resource, r.status, r.user_code, r.created, r.decided_at, r.last_used,
+                r.member_email
          FROM chatgpt_oauth_requests r LEFT JOIN chatgpt_oauth_clients k ON k.client_id=r.client_id
          WHERE r.status IN ('approved') OR (r.status='pending' AND r.created > ?1)
          ORDER BY r.created DESC LIMIT 100",
@@ -478,6 +580,7 @@ fn db_list(c: &Connection, now: f64) -> rusqlite::Result<Vec<Value>> {
             "redirect_uri": r.get::<_, String>(3)?, "scope": r.get::<_, String>(4)?, "resource": r.get::<_, String>(5)?,
             "status": r.get::<_, String>(6)?, "user_code": r.get::<_, String>(7)?, "created": r.get::<_, f64>(8)?,
             "decided_at": r.get::<_, Option<f64>>(9)?, "last_used": r.get::<_, Option<f64>>(10)?,
+            "member": r.get::<_, Option<String>>(11)?,
         }))
     })?;
     rows.collect()
@@ -659,6 +762,62 @@ async fn authorize(State(state): State<AppState>, headers: HeaderMap, uri: Uri, 
         Err(e) => return bounce("server_error", &e.to_string(), "chatgpt_authorize_store_failed"),
     };
     audit(json!({"ts": now, "event": "grant_requested", "request": id, "client_id": client_id, "client_name": client_name, "scope": scope, "resource": resource}));
+
+    // A verified member or the owner approves their own request here, through
+    // the same approval the owner's Settings click uses, and the browser goes
+    // straight back to the client with the code. Nothing else does.
+    let owner_session_valid = super::static_files::owner_session_status(&state, &headers) == "valid";
+    match auto_approval(&headers, &uri, state.auth_token.as_deref(), owner_session_valid) {
+        Ok(who) => {
+            let member = match who {
+                AutoApproval::Member(m) => Some(m),
+                AutoApproval::Owner => None,
+            };
+            let (id2, ps2, m2) = (id.clone(), poll_secret.clone(), member.clone());
+            let minted = write_ret(&state, move |c| {
+                if !db_approve(c, &id2, m2.as_ref(), now)? {
+                    return Ok(None);
+                }
+                Ok(match db_poll(c, &id2, &ps2, now)? {
+                    PollOutcome::Approved(ruri, st, code) => Some((ruri, st, code)),
+                    _ => None,
+                })
+            })
+            .await;
+            match minted {
+                Ok(Some((ruri, st, code))) => {
+                    let verdict = if member.is_some() { "chatgpt_authorize_auto_member" } else { "chatgpt_authorize_auto_owner" };
+                    let member_email = member.as_ref().map(|m| m.email.clone());
+                    audit(json!({"ts": now, "event": "grant_approved", "request": id, "client_id": client_id,
+                        "approved_by": member_email.as_ref().map(|e| format!("member:{e}")).unwrap_or_else(|| "owner".into()),
+                        "member": member_email, "member_scope_level": member.as_ref().map(|m| m.scope_level.clone()),
+                        "member_scope_name": member.as_ref().map(|m| m.scope_name.clone()),
+                        "member_team_id": member.as_ref().map(|m| m.team_id.clone())}));
+                    tracing::warn!(target: "amux::chatgpt_app", verdict, request = %id, member = member_email.as_deref().unwrap_or(""),
+                        measured = true, n_considered = 1, "chatgpt app: the authorize page approved its own request for a verified identity");
+                    let loc = code_redirect(&ruri, &code, &st, &base);
+                    let mut r = if wants_json(&headers) {
+                        Json(json!({"status": "approved", "request": id, "redirect": loc})).into_response()
+                    } else {
+                        (StatusCode::FOUND, [(axum::http::header::LOCATION, loc)]).into_response()
+                    };
+                    r.headers_mut().insert("cache-control", HeaderValue::from_static("no-store"));
+                    return r;
+                }
+                Ok(None) => {
+                    tracing::warn!(target: "amux::chatgpt_app", verdict = "chatgpt_authorize_auto_not_applied", request = %id,
+                        "chatgpt app: the request was no longer pending; falling back to the owner's code");
+                }
+                Err(e) => return bounce("server_error", &e.to_string(), "chatgpt_authorize_store_failed"),
+            }
+        }
+        Err("no_identity") => {}
+        Err(why) => {
+            tracing::warn!(target: "amux::chatgpt_app", verdict = "chatgpt_authorize_auto_refused", why, request = %id,
+                measured = true, n_considered = 1, "chatgpt app: this request may not approve itself; it waits for the owner's code");
+        }
+    }
+
     tracing::warn!(target: "amux::chatgpt_app", verdict = "chatgpt_grant_pending_owner", request = %id, user_code = %user_code,
         "chatgpt app: a connection is waiting for the owner's approval in Settings > ChatGPT");
     // A programmatic client (the cloud front door) asks for JSON: the same
@@ -673,22 +832,96 @@ async fn authorize(State(state): State<AppState>, headers: HeaderMap, uri: Uri, 
         r.headers_mut().insert("cache-control", HeaderValue::from_static("no-store"));
         return r;
     }
+    // The relay forwards only the OAuth and /mcp paths, so a sign-in link is
+    // offered only where the browser reaches amux directly.
+    let sign_in = (super::sso::configured() && headers.get(RELAY_HEADER).is_none()).then(|| sso_sign_in_link(q.as_deref()));
+    let body = pending_body(&client_name, &scope, &user_code, &id, &poll_secret, sign_in.as_deref());
+    html_page("Approve amux connection", &body)
+}
+
+/// The code page. `sign_in` is the `/sso/login?next=...` link offered to team
+/// members; the owner's code below it stays the break-glass path.
+pub(crate) fn pending_body(client_name: &str, scope: &str, user_code: &str, id: &str, poll_secret: &str, sign_in: Option<&str>) -> String {
     let esc = crate::integrations::email::html_escape;
-    let body = format!(
-        "<h2>Approve in amux</h2><p>{who} wants to use your amux ({scope}).</p>\
+    let member = sign_in
+        .map(|href| {
+            format!(
+                "<p><a href='{href}' style='display:inline-block;background:#2f6feb;color:#fff;padding:10px 18px;\
+                 border-radius:6px;text-decoration:none;font-weight:600'>Sign in to connect as yourself</a></p>\
+                 <p class=dim>Team members: sign in with your organization account and this connection is approved \
+                 for you, with your access. Or ask the owner to approve the code below.</p>",
+                href = esc(href)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "<h2>Approve in amux</h2><p>{who} wants to use your amux ({scope}).</p>{member}\
          <p>Open amux on a device you own, go to <b>Settings &gt; ChatGPT</b>, and approve this code:</p>\
          <p><code>{code}</code></p><p class=dim id=s>Waiting for approval. This page continues by itself.</p>\
          <script>(function(){{var u='oauth/authorize/status?id={id}&k={k}';var p=location.pathname.replace(/oauth\\/authorize$/,'');\
          function t(){{fetch(p+u,{{cache:'no-store'}}).then(function(r){{return r.json()}}).then(function(d){{\
          if(d.redirect){{location.replace(d.redirect);return}}if(d.status!=='pending'){{document.getElementById('s').textContent=d.message||d.status;return}}\
          setTimeout(t,2000)}}).catch(function(){{setTimeout(t,4000)}})}}t()}})()</script>",
-        who = esc(if client_name.is_empty() { "A ChatGPT connector" } else { &client_name }),
-        scope = esc(&scope),
-        code = esc(&user_code),
+        who = esc(if client_name.is_empty() { "A ChatGPT connector" } else { client_name }),
+        scope = esc(scope),
+        code = esc(user_code),
         id = id,
         k = poll_secret,
-    );
-    html_page("Approve amux connection", &body)
+    )
+}
+
+/// `/sso/login` with a `next` that brings the browser back to this same
+/// authorize request. Relative, because `sso::safe_next` accepts nothing else.
+pub(crate) fn sso_sign_in_link(query: Option<&str>) -> String {
+    let here = format!("/oauth/authorize?{}", query.unwrap_or(""));
+    format!("/sso/login?next={}", crate::integrations::email::urlencode(&here))
+}
+
+/// Who may approve a request from the authorize page itself.
+pub(crate) enum AutoApproval {
+    Owner,
+    Member(GrantMember),
+}
+
+/// Pure, so the tests pin it. `Err("no_identity")` is the ordinary case (the
+/// page shows the code); any other `Err` names why an identity was not used.
+/// Only explicit credentials count: the owner bearer, the verified member
+/// markers (written by `org::local_member_identity`, never by a client), or
+/// a valid owner session. Locality and relay headers earn nothing.
+pub(crate) fn auto_approval(headers: &HeaderMap, uri: &Uri, owner_token: Option<&str>, owner_session_valid: bool) -> Result<AutoApproval, &'static str> {
+    // The member middleware writes `x-amux-session: member:<email>` for a
+    // verified member that sent no worker header; any other value is a worker.
+    if headers.get("x-amux-worker").is_some() {
+        return Err("worker_origin");
+    }
+    if let Some(sess) = headers.get("x-amux-session") {
+        let actor = super::org::local_member_actor(headers);
+        if actor.is_none() || sess.to_str().ok() != actor {
+            return Err("worker_origin");
+        }
+    }
+    // The owner's explicit credential wins over a member cookie, as in
+    // `auth::require_bearer`.
+    let owner_token_ok = owner_token.is_some_and(|exp| {
+        super::auth::provided_owner_token(headers, uri).is_some_and(|t| super::auth::constant_time_eq(t.as_bytes(), exp.as_bytes()))
+    });
+    if owner_token_ok {
+        return Ok(AutoApproval::Owner);
+    }
+    if super::org::is_verified_local_member(headers) {
+        return GrantMember::from_verified_headers(headers).map(AutoApproval::Member).ok_or("member_identity_incomplete");
+    }
+    if owner_session_valid {
+        return Ok(AutoApproval::Owner);
+    }
+    Err("no_identity")
+}
+
+/// Where the browser goes once it holds the one-time code (RFC 9207 `iss`).
+fn code_redirect(redirect_uri: &str, code: &str, state: &str, iss: &str) -> String {
+    let sep = if redirect_uri.contains('?') { '&' } else { '?' };
+    let enc = crate::integrations::email::urlencode;
+    format!("{redirect_uri}{sep}code={}&state={}&iss={}", enc(code), enc(state), enc(iss))
 }
 
 async fn authorize_status(State(state): State<AppState>, headers: HeaderMap, uri: Uri, RawQuery(q): RawQuery) -> Response {
@@ -698,9 +931,7 @@ async fn authorize_status(State(state): State<AppState>, headers: HeaderMap, uri
     let out = write_ret(&state, move |c| db_poll(c, &id, &k, now)).await;
     let body = match out {
         Ok(PollOutcome::Approved(ruri, st, code)) => {
-            let sep = if ruri.contains('?') { '&' } else { '?' };
-            let enc = crate::integrations::email::urlencode;
-            json!({"status": "approved", "redirect": format!("{ruri}{sep}code={}&state={}&iss={}", enc(&code), enc(&st), enc(&public_base(&headers, &uri)))})
+            json!({"status": "approved", "redirect": code_redirect(&ruri, &code, &st, &public_base(&headers, &uri))})
         }
         Ok(PollOutcome::Pending) => json!({"status": "pending"}),
         Ok(PollOutcome::Denied) => json!({"status": "denied", "message": "The owner declined this connection."}),
@@ -736,7 +967,8 @@ async fn token(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -
     let _ = headers;
     match issued {
         Ok(Ok(i)) => {
-            audit(json!({"ts": now, "event": "token_issued", "grant": i.grant_id, "client_id": client_id, "grant_type": kv_get(&kv, "grant_type")}));
+            audit(json!({"ts": now, "event": "token_issued", "grant": i.grant_id, "client_id": client_id, "grant_type": kv_get(&kv, "grant_type"),
+                "member": i.member}));
             let mut r = Json(json!({
                 "access_token": i.access, "token_type": "Bearer", "expires_in": ACCESS_TTL_S as i64,
                 "refresh_token": i.refresh, "scope": i.scope,
@@ -922,14 +1154,57 @@ fn local_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
-/// One call to amux's own API as the owner. The OAuth check already ran; this
-/// hop is the dashboard's path, so every gate the dashboard meets applies.
-async fn local(state: &AppState, grant: &str, method: reqwest::Method, path: &str, body: Option<Value>) -> (u16, Value) {
-    let url = format!("https://127.0.0.1:{}{path}", crate::legacy_port::canonical_port());
-    let mut rb = local_client().request(method, &url).header("x-amux-client", format!("chatgpt-app; grant={grant}"));
-    if let Some(t) = &state.auth_token {
-        rb = rb.bearer_auth(t);
+/// Whose credential a grant's tool calls carry into amux's own API.
+pub(crate) enum Caller {
+    /// An owner grant: the owner token, as the dashboard sends it.
+    Owner,
+    /// A member grant: that member's own live session, verified again by the
+    /// member middleware on every call.
+    Member { session: String },
+}
+
+/// The caller for this grant. A member grant whose member has no live session
+/// left (deleted, email changed, every SSO session expired) is refused: it
+/// never falls back to the owner's credential.
+async fn caller_for(state: &AppState, b: &Bearer) -> Result<Caller, &'static str> {
+    let Some(m) = &b.member else {
+        return Ok(Caller::Owner);
+    };
+    let store = state.store.clone();
+    let now = chrono::Utc::now().timestamp();
+    let (id, email) = (m.id.clone(), m.email.clone());
+    let found = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+        let c = store.read()?;
+        Ok(super::org::live_member_session(&c, &id, &email, now)?)
+    })
+    .await;
+    match found {
+        Ok(Ok(Some(session))) => Ok(Caller::Member { session }),
+        Ok(Ok(None)) => Err("member_session_missing"),
+        _ => Err("member_session_unreadable"),
     }
+}
+
+/// Attach the caller's credential to a loopback call. Never both: a member's
+/// call must not carry the owner token, which `require_bearer` would prefer.
+pub(crate) fn with_caller(rb: reqwest::RequestBuilder, caller: &Caller, owner_token: Option<&str>) -> reqwest::RequestBuilder {
+    match caller {
+        Caller::Owner => match owner_token {
+            Some(t) => rb.bearer_auth(t),
+            None => rb,
+        },
+        Caller::Member { session } => rb.header(reqwest::header::COOKIE, super::org::member_cookie_pair(session)),
+    }
+}
+
+/// One call to amux's own API as this grant's caller (the owner, or the member
+/// the grant is bound to). The OAuth check already ran; this hop is the
+/// dashboard's path, so every gate the dashboard (or that member's browser)
+/// meets applies.
+async fn local(state: &AppState, caller: &Caller, grant: &str, method: reqwest::Method, path: &str, body: Option<Value>) -> (u16, Value) {
+    let url = format!("https://127.0.0.1:{}{path}", crate::legacy_port::canonical_port());
+    let rb = local_client().request(method, &url).header("x-amux-client", format!("chatgpt-app; grant={grant}"));
+    let mut rb = with_caller(rb, caller, state.auth_token.as_deref());
     if let Some(b) = body {
         rb = rb.json(&b);
     }
@@ -970,16 +1245,29 @@ fn strip_ansi(s: &str) -> String {
 async fn call_tool(state: &AppState, b: &Bearer, _base: &str, name: &str, args: &Value) -> Value {
     let now = now_f64();
     let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let member = b.member.as_ref().map(|m| m.email.as_str());
     if write_tool(name) && !b.scope.split_whitespace().any(|x| x == "amux:write") {
-        tracing::warn!(target: "amux::chatgpt_app", verdict = "chatgpt_tool_scope_refused", tool = name, grant = %b.grant_id, "chatgpt app: write tool without amux:write");
+        tracing::warn!(target: "amux::chatgpt_app", verdict = "chatgpt_tool_scope_refused", tool = name, grant = %b.grant_id,
+            member = member.unwrap_or(""), "chatgpt app: write tool without amux:write");
         return tool_err("this connection was approved read-only (amux:read); reconnect with amux:write to use this tool");
     }
-    audit(json!({"ts": now, "event": "tool_call", "tool": name, "grant": b.grant_id, "client_id": b.client_id,
+    let caller = match caller_for(state, b).await {
+        Ok(c) => c,
+        Err(why) => {
+            tracing::warn!(target: "amux::chatgpt_app", verdict = "chatgpt_tool_member_refused", why, tool = name, grant = %b.grant_id,
+                member = member.unwrap_or(""), measured = true, n_considered = 1,
+                "chatgpt app: the member this connection belongs to has no live session; refused, never run as the owner");
+            audit(json!({"ts": now, "event": "tool_refused", "tool": name, "grant": b.grant_id, "client_id": b.client_id, "member": member, "why": why}));
+            return tool_err("the amux member who approved this connection has no active session (signed out, expired, or removed). Sign in to amux again in a browser, or reconnect.");
+        }
+    };
+    audit(json!({"ts": now, "event": "tool_call", "tool": name, "grant": b.grant_id, "client_id": b.client_id, "member": member,
         "target": args.get("name").or_else(|| args.get("id")).cloned().unwrap_or(Value::Null)}));
     let g = b.grant_id.as_str();
+    let who = &caller;
     match name {
         "list_workers" => {
-            let (code, v) = local(state, g, reqwest::Method::GET, "/api/sessions", None).await;
+            let (code, v) = local(state, who, g, reqwest::Method::GET, "/api/sessions", None).await;
             if code != 200 {
                 return tool_result(json!({"status": code, "response": v}), true);
             }
@@ -1007,7 +1295,7 @@ async fn call_tool(state: &AppState, b: &Bearer, _base: &str, name: &str, args: 
                 return tool_err("name must be an existing worker name");
             }
             let lines = args.get("lines").and_then(Value::as_u64).unwrap_or(120).clamp(10, 400) as usize;
-            let (code, v) = local(state, g, reqwest::Method::GET, &format!("/api/sessions/{}/peek?lines={}", enc(&n), lines.max(200)), None).await;
+            let (code, v) = local(state, who, g, reqwest::Method::GET, &format!("/api/sessions/{}/peek?lines={}", enc(&n), lines.max(200)), None).await;
             if code != 200 {
                 return tool_result(json!({"status": code, "response": v}), true);
             }
@@ -1025,10 +1313,15 @@ async fn call_tool(state: &AppState, b: &Bearer, _base: &str, name: &str, args: 
                 return tool_err("name and text are required");
             }
             let text: String = text.chars().take(8000).collect();
-            let stamped = format!(
-                "[amux-origin: chatgpt (owner-approved connector, grant {g}), stamped by the amux server]\n\n{text}"
-            );
-            let (code, v) = local(state, g, reqwest::Method::POST, &format!("/api/sessions/{}/send", enc(&n)), Some(json!({"text": stamped}))).await;
+            let stamped = match member {
+                Some(email) => format!(
+                    "[amux-origin: chatgpt (connector of member:{email}, grant {g}), stamped by the amux server]\n\n{text}"
+                ),
+                None => format!(
+                    "[amux-origin: chatgpt (owner-approved connector, grant {g}), stamped by the amux server]\n\n{text}"
+                ),
+            };
+            let (code, v) = local(state, who, g, reqwest::Method::POST, &format!("/api/sessions/{}/send", enc(&n)), Some(json!({"text": stamped}))).await;
             tool_result(json!({"status": code, "response": v}), !(200..300).contains(&code))
         }
         "list_board" => {
@@ -1036,7 +1329,7 @@ async fn call_tool(state: &AppState, b: &Bearer, _base: &str, name: &str, args: 
             let status = s("status");
             let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50).clamp(1, 200) as usize;
             let path = if sess.is_empty() { "/api/board?all=1".to_string() } else { format!("/api/board?session={}", enc(&sess)) };
-            let (code, v) = local(state, g, reqwest::Method::GET, &path, None).await;
+            let (code, v) = local(state, who, g, reqwest::Method::GET, &path, None).await;
             if code != 200 {
                 return tool_result(json!({"status": code, "response": v}), true);
             }
@@ -1064,12 +1357,13 @@ async fn call_tool(state: &AppState, b: &Bearer, _base: &str, name: &str, args: 
             let st = match s("status").as_str() { "backlog" => "backlog", _ => "todo" };
             let mut body = json!({"title": title.chars().take(300).collect::<String>(), "status": st});
             let desc = s("desc");
-            body["desc"] = json!(format!("{}{}(added from ChatGPT, grant {g})", desc, if desc.is_empty() { "" } else { "\n\n" }));
+            let by = member.map(|e| format!(", member:{e}")).unwrap_or_default();
+            body["desc"] = json!(format!("{}{}(added from ChatGPT, grant {g}{by})", desc, if desc.is_empty() { "" } else { "\n\n" }));
             let sess = s("session");
             if !sess.is_empty() {
                 body["session"] = json!(sess);
             }
-            let (code, v) = local(state, g, reqwest::Method::POST, "/api/board", Some(body)).await;
+            let (code, v) = local(state, who, g, reqwest::Method::POST, "/api/board", Some(body)).await;
             let created = code == 201 || v.get("card_created").and_then(Value::as_bool) == Some(true);
             tool_result(json!({"status": code, "created": created,
                 "meaning": if created { "a new card" } else if (200..300).contains(&code) { "amux folded this into an existing card" } else { "refused" },
@@ -1085,12 +1379,12 @@ async fn call_tool(state: &AppState, b: &Bearer, _base: &str, name: &str, args: 
             if !ev.is_empty() {
                 body["evidence"] = json!(ev);
             }
-            let (code, v) = local(state, g, reqwest::Method::PATCH, &format!("/api/board/{id}"), Some(body)).await;
+            let (code, v) = local(state, who, g, reqwest::Method::PATCH, &format!("/api/board/{id}"), Some(body)).await;
             if !(200..300).contains(&code) {
                 return tool_result(json!({"status": code, "refused_by_board": v}), true);
             }
             // Read back: a 2xx is not proof the status is what was asked.
-            let (_, after) = local(state, g, reqwest::Method::GET, &format!("/api/board/{id}"), None).await;
+            let (_, after) = local(state, who, g, reqwest::Method::GET, &format!("/api/board/{id}"), None).await;
             let now_status = after.get("status").cloned().unwrap_or(Value::Null);
             let landed = now_status.as_str() == Some(st.as_str());
             tool_result(json!({"status": code, "requested": st, "board_now_says": now_status, "landed": landed}), !landed)
@@ -1161,9 +1455,12 @@ async fn decide(state: AppState, headers: HeaderMap, uri: Uri, id: String, appro
     }
     let now = now_f64();
     let id2 = id.clone();
-    match write_ret(&state, move |c| db_decide(c, &id2, approve, now)).await {
+    let decided = write_ret(&state, move |c| if approve { db_approve(c, &id2, None, now) } else { db_decide(c, &id2, false, now) }).await;
+    match decided {
         Ok(true) => {
-            audit(json!({"ts": now, "event": if approve { "grant_approved" } else { "grant_denied" }, "request": id}));
+            let approved_by = approve.then_some("owner_code");
+            audit(json!({"ts": now, "event": if approve { "grant_approved" } else { "grant_denied" }, "request": id,
+                "approved_by": approved_by}));
             Json(json!({"ok": true, "id": id, "status": if approve { "approved" } else { "denied" }})).into_response()
         }
         Ok(false) => (StatusCode::CONFLICT, Json(json!({"ok": false, "error": "no pending, unexpired request with that id"}))).into_response(),
@@ -1205,6 +1502,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = Connection::open(dir.path().join("t.db")).unwrap();
         c.execute_batch(include_str!("../../migrations/0098_chatgpt_app_oauth.sql")).unwrap();
+        // Through the runner: its columns are `-- ADDCOL:` directives.
+        crate::db::migrate::apply_one(&c, include_str!("../../migrations/0169_chatgpt_member_grants.sql")).unwrap();
         (dir, c)
     }
 
@@ -1487,5 +1786,231 @@ mod tests {
         assert_eq!(asm["code_challenge_methods_supported"], json!(["S256"]));
         let (s, _, _) = call(&a, Request::get("/mcp").body(Body::empty()).unwrap()).await;
         assert_eq!(s, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    // -----------------------------------------------------------------------
+    // Member and owner approval at /oauth/authorize, through the full router
+    // so the member middleware (the only writer of the verified markers) runs.
+    // -----------------------------------------------------------------------
+
+    const CB: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
+
+    async fn raw(app: &Router, req: Request<Body>) -> (StatusCode, HeaderMap, String) {
+        let r = app.clone().oneshot(req).await.unwrap();
+        let (s, h) = (r.status(), r.headers().clone());
+        let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        (s, h, String::from_utf8_lossy(&b).into_owned())
+    }
+
+    /// A member scoped to one worker, signed in through an invite link.
+    /// Returns the `amux_member=<token>` cookie their browser holds.
+    async fn signed_in_member(dir: &std::path::Path, a: &Router, email: &str) -> String {
+        {
+            let conn = Connection::open(dir.join("s.db")).unwrap();
+            conn.execute(
+                "INSERT INTO _amux_workers \
+                 (id,display_name,name_aliases,cwd,provider,backend,environment,permissions,state,version,created_at,updated_at) \
+                 VALUES ('wrk_allowed','allowed-worker','[]','/tmp','claude','tmux','{}','[]','{\"state\":\"stopped\"}',0,'now','now')",
+                [],
+            )
+            .unwrap();
+        }
+        let (s, _, body) = raw(a, Request::post("/api/org/invites").header("authorization", "Bearer owner-tok")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"email": email, "scope_level": "worker", "scope_name": "allowed-worker"}).to_string())).unwrap()).await;
+        assert_eq!(s, StatusCode::CREATED, "{body}");
+        let token = serde_json::from_str::<Value>(&body).unwrap()["token"].as_str().unwrap().to_string();
+        let (s, h, body) = raw(a, Request::post(format!("/invite/{token}")).header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(format!("email={}&name=Member", enc(email)))).unwrap()).await;
+        assert_eq!(s, StatusCode::SEE_OTHER, "{body}");
+        h["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string()
+    }
+
+    async fn register_client(a: &Router) -> String {
+        let (s, _, body) = raw(a, Request::post("/oauth/register").header("host", "amux.test").header("content-type", "application/json")
+            .body(Body::from(json!({"client_name": "ChatGPT", "redirect_uris": [CB]}).to_string())).unwrap()).await;
+        assert_eq!(s, StatusCode::CREATED, "{body}");
+        serde_json::from_str::<Value>(&body).unwrap()["client_id"].as_str().unwrap().to_string()
+    }
+
+    fn authorize_path(cid: &str) -> String {
+        format!("/oauth/authorize?response_type=code&client_id={cid}&redirect_uri={}&code_challenge={CHALLENGE}&code_challenge_method=S256&state=xyz",
+            enc(CB))
+    }
+
+    fn approved_count(st: &AppState) -> i64 {
+        let c = st.store.read().unwrap();
+        c.query_row("SELECT COUNT(*) FROM chatgpt_oauth_requests WHERE status='approved'", [], |r| r.get(0)).unwrap()
+    }
+
+    async fn redeem(a: &Router, cid: &str, location: &str) -> String {
+        assert!(location.starts_with(&format!("{CB}?code=")), "{location}");
+        assert!(location.contains("state=xyz") && location.contains("iss=https%3A%2F%2Famux.test"), "{location}");
+        let code = location.split("code=").nth(1).unwrap().split('&').next().unwrap();
+        let form = format!("grant_type=authorization_code&code={code}&client_id={cid}&redirect_uri={}&code_verifier={VERIFIER}", enc(CB));
+        let (s, _, body) = raw(a, Request::post("/oauth/token").header("host", "amux.test")
+            .header("content-type", "application/x-www-form-urlencoded").body(Body::from(form)).unwrap()).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        serde_json::from_str::<Value>(&body).unwrap()["access_token"].as_str().unwrap().to_string()
+    }
+
+    fn bearer_of(st: &AppState, at: &str) -> Bearer {
+        let c = st.store.read().unwrap();
+        db_check_access(&c, at, "https://amux.test/mcp", now_f64()).unwrap().unwrap()
+    }
+
+    /// (a) + (f): a signed-in member is approved without the owner, the grant
+    /// carries them, and its tool calls present that member's own session
+    /// (never the owner token), which the API treats as that member.
+    #[tokio::test]
+    async fn a_signed_in_member_is_approved_at_once_and_tool_calls_run_as_them() {
+        let (d, st) = state();
+        let a = crate::api::router(st.clone());
+        let cookie = signed_in_member(d.path(), &a, "ann@example.com").await;
+        let cid = register_client(&a).await;
+
+        let (s, h, body) = raw(&a, Request::get(authorize_path(&cid)).header("host", "amux.test").header("cookie", &cookie)
+            .body(Body::empty()).unwrap()).await;
+        assert_eq!(s, StatusCode::FOUND, "a verified member is not asked for the owner's code: {body}");
+        let at = redeem(&a, &cid, h["location"].to_str().unwrap()).await;
+
+        let b = bearer_of(&st, &at);
+        let m = b.member.clone().expect("the grant is bound to the member");
+        assert_eq!(m.email, "ann@example.com");
+        assert_eq!((m.scope_level.as_str(), m.scope_name.as_str()), ("worker", "allowed-worker"));
+        assert!(!m.id.is_empty());
+        let (s, _, _) = call(&a, rpc("tools/list", Some(at.as_str()))).await;
+        assert_eq!(s, StatusCode::OK);
+
+        // The member's own session, not the owner token.
+        let caller = caller_for(&st, &b).await.unwrap_or_else(|e| panic!("{e}"));
+        let req = with_caller(reqwest::Client::new().get("https://127.0.0.1/api/org/members"), &caller, Some("owner-tok")).build().unwrap();
+        assert_eq!(req.headers()["cookie"].to_str().unwrap(), cookie);
+        assert!(req.headers().get("authorization").is_none(), "a member's call never carries the owner token");
+        // amux's API resolves that credential as the member: org admin is refused.
+        let (s, _, _) = raw(&a, Request::get("/api/org/members").header("cookie", req.headers()["cookie"].to_str().unwrap())
+            .body(Body::empty()).unwrap()).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let owner = with_caller(reqwest::Client::new().get("https://127.0.0.1/x"), &Caller::Owner, Some("owner-tok")).build().unwrap();
+        assert_eq!(owner.headers()["authorization"], "Bearer owner-tok");
+
+        // Removing the member ends the connection's reach; no owner fallback.
+        let (s, _, _) = raw(&a, Request::delete(format!("/api/org/members/{}", m.id)).header("authorization", "Bearer owner-tok")
+            .body(Body::empty()).unwrap()).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(caller_for(&st, &b).await.err(), Some("member_session_missing"));
+    }
+
+    /// (b): no identity, arriving through the relay from loopback: the code
+    /// page, no sign-in link (the relay does not forward /sso/*), still pending.
+    #[tokio::test]
+    async fn no_identity_gets_the_code_page_and_stays_pending_even_from_loopback() {
+        let (_d, st) = state();
+        let a = crate::api::router(st.clone());
+        let cid = register_client(&a).await;
+        let mut req = Request::get(authorize_path(&cid)).header("host", "amux.test").header(RELAY_HEADER, "1").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5555))));
+        let (s, _, page) = raw(&a, req).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(page.contains("Approve in amux") && !page.contains("/sso/login"), "{page}");
+        let id = page.split("status?id=").nth(1).unwrap().split('&').next().unwrap().to_string();
+        let k = page.split("&k=").nth(1).unwrap().split('\'').next().unwrap().to_string();
+        let (_, _, p) = call(&a, Request::get(format!("/oauth/authorize/status?id={id}&k={k}")).header("host", "amux.test").body(Body::empty()).unwrap()).await;
+        assert_eq!(p["status"], "pending");
+        assert_eq!(approved_count(&st), 0);
+    }
+
+    /// (b): with SSO configured the page offers sign-in, and the `next` it
+    /// carries survives `sso::safe_next` back to this same authorize request.
+    #[test]
+    fn the_code_page_offers_sign_in_that_returns_to_the_same_request() {
+        let q = "response_type=code&client_id=amux-mcp-1&state=a%2Fb";
+        let link = sso_sign_in_link(Some(q));
+        assert!(link.starts_with("/sso/login?next=%2Foauth%2Fauthorize%3F"), "{link}");
+        let next = super::super::fs::parse_qs(link.split_once('?').unwrap().1).into_iter().find(|(k, _)| k == "next").unwrap().1;
+        assert_eq!(super::super::sso::safe_next(Some(&next)), format!("/oauth/authorize?{q}"));
+
+        let with = pending_body("ChatGPT", "amux:read", "AB12-CD34", "cg-1", "k", Some(&link));
+        assert!(with.contains("href='/sso/login?next=") && with.contains("AB12-CD34"), "the owner's code stays: {with}");
+        let without = pending_body("ChatGPT", "amux:read", "AB12-CD34", "cg-1", "k", None);
+        assert!(!without.contains("/sso/login") && without.contains("AB12-CD34"));
+    }
+
+    /// (c): member markers a client sends itself are stripped by the member
+    /// middleware, so they approve nothing.
+    #[tokio::test]
+    async fn forged_member_headers_approve_nothing() {
+        let (_d, st) = state();
+        let a = crate::api::router(st.clone());
+        let cid = register_client(&a).await;
+        let mut req = Request::get(authorize_path(&cid)).header("host", "amux.test").body(Body::empty()).unwrap();
+        for (k, v) in crate::api::org::test_member_headers("mallory@example.com", true).iter() {
+            req.headers_mut().insert(k.clone(), v.clone());
+        }
+        req.headers_mut().insert("x-amux-user-id", HeaderValue::from_static("mem_forged"));
+        let (s, _, page) = raw(&a, req).await;
+        assert_eq!(s, StatusCode::OK, "{page}");
+        assert!(page.contains("Approve in amux"));
+        assert_eq!(approved_count(&st), 0);
+    }
+
+    /// (d): a worker never approves here, even holding a member's cookie.
+    #[tokio::test]
+    async fn a_worker_origin_never_auto_approves() {
+        let (d, st) = state();
+        let a = crate::api::router(st.clone());
+        let cookie = signed_in_member(d.path(), &a, "bob@example.com").await;
+        let cid = register_client(&a).await;
+        for (k, v) in [("x-amux-worker", "w1"), ("x-amux-session", "w1")] {
+            let (s, _, page) = raw(&a, Request::get(authorize_path(&cid)).header("host", "amux.test").header("cookie", &cookie)
+                .header(k, v).body(Body::empty()).unwrap()).await;
+            assert_eq!(s, StatusCode::OK, "{k}: {page}");
+        }
+        let (s, _, _) = raw(&a, Request::get(authorize_path(&cid)).header("host", "amux.test")
+            .header("authorization", "Bearer owner-tok").header("x-amux-session", "amux").body(Body::empty()).unwrap()).await;
+        assert_eq!(s, StatusCode::OK, "the owner token in a worker's hands approves nothing here");
+        assert_eq!(approved_count(&st), 0);
+    }
+
+    #[test]
+    fn auto_approval_counts_explicit_credentials_only() {
+        let uri: Uri = "/oauth/authorize".parse().unwrap();
+        let mut member = crate::api::org::test_member_headers("ann@example.com", false);
+        member.insert("x-amux-user-id", HeaderValue::from_static("mem_1"));
+        member.insert("x-amux-session", HeaderValue::from_static("member:ann@example.com"));
+        assert!(matches!(auto_approval(&member, &uri, Some("tok"), false), Ok(AutoApproval::Member(m)) if m.email == "ann@example.com" && m.id == "mem_1"));
+        let mut worker = member.clone();
+        worker.insert("x-amux-session", HeaderValue::from_static("other-worker"));
+        assert_eq!(auto_approval(&worker, &uri, Some("tok"), false).err(), Some("worker_origin"));
+        assert_eq!(auto_approval(&hdrs(&[(RELAY_HEADER, "1")]), &uri, Some("tok"), false).err(), Some("no_identity"));
+        assert_eq!(auto_approval(&hdrs(&[("authorization", "Bearer nope")]), &uri, Some("tok"), false).err(), Some("no_identity"));
+        assert!(matches!(auto_approval(&hdrs(&[("authorization", "Bearer tok")]), &uri, Some("tok"), false), Ok(AutoApproval::Owner)));
+        assert!(matches!(auto_approval(&hdrs(&[(RELAY_HEADER, "1")]), &uri, None, true), Ok(AutoApproval::Owner)));
+        assert_eq!(auto_approval(&hdrs(&[("x-amux-worker", "w")]), &uri, Some("tok"), true).err(), Some("worker_origin"));
+    }
+
+    /// (e): the owner's bearer approves at once with no member binding, and
+    /// the owner's code approval in Settings still works as the fallback.
+    #[tokio::test]
+    async fn the_owner_approves_directly_or_by_code() {
+        let (_d, st) = state();
+        let a = crate::api::router(st.clone());
+        let cid = register_client(&a).await;
+        let (s, h, body) = raw(&a, Request::get(authorize_path(&cid)).header("host", "amux.test")
+            .header("authorization", "Bearer owner-tok").body(Body::empty()).unwrap()).await;
+        assert_eq!(s, StatusCode::FOUND, "{body}");
+        let at = redeem(&a, &cid, h["location"].to_str().unwrap()).await;
+        assert!(bearer_of(&st, &at).member.is_none(), "an owner grant carries no member");
+
+        let (s, _, page) = raw(&a, Request::get(authorize_path(&cid)).header("host", "amux.test").body(Body::empty()).unwrap()).await;
+        assert_eq!(s, StatusCode::OK);
+        let id = page.split("status?id=").nth(1).unwrap().split('&').next().unwrap().to_string();
+        let k = page.split("&k=").nth(1).unwrap().split('\'').next().unwrap().to_string();
+        let (s, _, body) = raw(&a, Request::post(format!("/api/chatgpt-app/requests/{id}/approve")).header("authorization", "Bearer owner-tok")
+            .body(Body::empty()).unwrap()).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        let (_, _, p) = call(&a, Request::get(format!("/oauth/authorize/status?id={id}&k={k}")).header("host", "amux.test").body(Body::empty()).unwrap()).await;
+        let at = redeem(&a, &cid, p["redirect"].as_str().unwrap()).await;
+        assert!(bearer_of(&st, &at).member.is_none());
     }
 }
