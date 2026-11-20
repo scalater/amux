@@ -40,6 +40,7 @@ pub mod prod_change;
 pub mod runner;
 pub mod done_line;
 pub mod board_intake;
+pub mod card_requester;
 pub mod board_lifecycle;
 pub mod board_themes;
 pub mod branding;

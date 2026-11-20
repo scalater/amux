@@ -6443,6 +6443,8 @@ pub async fn create_item(
         },
         _ => None,
     };
+    // Scalater fork: who this card's work is for (api/card_requester.rs).
+    let requester_source = super::card_requester::source_for_create(&headers, &hdr_session);
     let new = bs::NewIssue {
         acceptance_criteria,
         next_action,
@@ -6578,6 +6580,7 @@ pub async fn create_item(
                 &format!("{}; disposition=create", intake.log_line()),
             ));
             bs::save_patched(conn, &mut row)?;
+            super::card_requester::stamp(conn, &row.id, &requester_source)?;
             let mut events = vec![ev_snap(&row, MutationKind::Created)];
             // AMUX-3391: fold the silent auto-capture card into this worker card
             // (see fold_capture_for_worker_card). The window is env-tunable.
@@ -7187,7 +7190,8 @@ pub async fn get_item(
             "frozen": !c.is_uncontracted(), "state": c.state, "verify_cmd": c.command,
             "verify_kind": c.kind, "deploy_check": c.deploy_check, "amended": c.amended, "sha": c.sha,
         }));
-        Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements, verification, (attempts, contract))))
+        let requester = super::card_requester::read(&conn, &row.id)?;
+        Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements, verification, (attempts, contract, requester))))
     })
     .await;
     match joined {
@@ -7199,7 +7203,7 @@ pub async fn get_item(
             asset_links,
             gate_requirements,
             verification,
-            (attempts, contract),
+            (attempts, contract, requester),
         )))) => {
             // Weak ETag for read-modify-write callers (AMUX-1711 parity).
             let mut headers = HeaderMap::new();
@@ -7209,6 +7213,7 @@ pub async fn get_item(
             let mut body = detail_body(&row);
             body["children"] = json!(children);
             body["messages"] = json!(messages);
+            body["requester"] = json!(requester);
             // Owner notes on the ask that is open now: what any answer to it
             // must carry (gs12 review finding 2).
             if bs::parse_status(&row.status) == Some(TaskStatus::NeedsYou) {

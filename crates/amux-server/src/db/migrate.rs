@@ -909,6 +909,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0169_chatgpt_member_grants",
         sql: include_str!("../../migrations/0169_chatgpt_member_grants.sql"),
     },
+    Migration {
+        version: 170,
+        name: "0170_issues_requester",
+        sql: include_str!("../../migrations/0170_issues_requester.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
