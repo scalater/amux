@@ -381,7 +381,34 @@ pub fn sign_in(conn: &Connection, cfg: &Config, who: &Identity, at: i64) -> rusq
 /// Outside auth: the provider's redirect carries no amux credential; the
 /// single-use `state` and PKCE are the guard.
 pub fn public_routes() -> Router<AppState> {
-    Router::new().route("/sso/login", get(login)).route("/sso/callback", get(callback))
+    Router::new()
+        .route("/sso/login", get(login))
+        .route("/sso/callback", get(callback))
+        .route("/sso/available", get(available))
+}
+
+/// A display name for the sign-in button, from the issuer's host only.
+pub fn provider_label(issuer: &str) -> &'static str {
+    let host = issuer.split("://").nth(1).unwrap_or("").split(['/', ':']).next().unwrap_or("");
+    match host {
+        "accounts.google.com" => "Google",
+        "login.microsoftonline.com" => "Microsoft",
+        h if h.ends_with(".okta.com") => "Okta",
+        _ => "single sign-on",
+    }
+}
+
+/// What a signed-out browser may learn: whether member sign-in exists and
+/// what to call it. Never the issuer, client id or redirect URL.
+pub fn availability(cfg: Option<&Config>) -> Value {
+    match cfg {
+        Some(c) if issuer_allowed(&c.issuer) => json!({"configured": true, "provider": provider_label(&c.issuer)}),
+        _ => json!({"configured": false}),
+    }
+}
+
+async fn available() -> Response {
+    ([(header::CACHE_CONTROL, "no-store")], Json(availability(config().as_ref()))).into_response()
 }
 
 /// Owner and admin view of the configuration (protected).
@@ -629,6 +656,30 @@ pub fn report() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg_with(issuer: &str) -> Config {
+        let mut c = cfg(&[]);
+        c.issuer = issuer.into();
+        c
+    }
+
+    #[test]
+    fn availability_names_the_provider_and_nothing_else() {
+        let v = availability(Some(&cfg_with("https://accounts.google.com")));
+        assert_eq!(v, json!({"configured": true, "provider": "Google"}));
+        let v = availability(Some(&cfg_with("https://acme.okta.com/oauth2/default")));
+        assert_eq!(v["provider"], "Okta");
+        let v = availability(Some(&cfg_with("https://idp.example.com")));
+        assert_eq!(v["provider"], "single sign-on");
+        let s = v.to_string();
+        assert!(!s.contains("idp.example.com") && !s.contains("client"), "leaked config: {s}");
+    }
+
+    #[test]
+    fn availability_is_off_without_a_usable_issuer() {
+        assert_eq!(availability(None), json!({"configured": false}));
+        assert_eq!(availability(Some(&cfg_with("http://idp.example.com"))), json!({"configured": false}));
+    }
     use jsonwebtoken::{encode, EncodingKey, Header};
 
     /// A P-256 key made for this test run; nothing is committed.

@@ -2961,6 +2961,33 @@ function _openConnectionSecurity(event) {
   // The section is a closed fold by default; arriving here to sign in opens it.
   const fold=document.querySelector('#connection-security details.settings-fold'); if(fold) fold.open=true;
   document.getElementById('connection-security')?.scrollIntoView({block:'nearest'});
+  _ssoOffer();
+}
+// Member single sign-on (scalater fork): offered wherever a signed-out browser is
+// sent to sign in, only when the server says it is set up (/sso/available).
+let _ssoAvailable = null;
+function _ssoSignInHref() {
+  return '/sso/login?next=' + encodeURIComponent(location.pathname + location.search);
+}
+function _ssoOffer() {
+  if (!_ssoAvailable) {
+    _ssoAvailable = fetch(location.origin + '/sso/available', {credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(10000)})
+      .then(r => r.ok ? r.json() : {configured: false}).catch(() => { _ssoAvailable = null; return {configured: false}; });
+  }
+  return _ssoAvailable.then(sso => {
+    if (!sso || !sso.configured) return;
+    const label = 'Sign in with ' + (sso.provider || 'single sign-on');
+    const box = document.getElementById('connection-sso');
+    const link = document.getElementById('connection-sso-sign-in');
+    if (box && link) { link.textContent = label; link.href = _ssoSignInHref(); box.hidden = false; }
+    const bar = document.getElementById('amux-auth-withheld');
+    if (bar && !document.getElementById('amux-auth-withheld-sso')) {
+      const a = document.createElement('a');
+      a.id = 'amux-auth-withheld-sso'; a.className = 'btn'; a.href = _ssoSignInHref(); a.textContent = label;
+      a.style.marginLeft = 'var(--space-2)';
+      bar.appendChild(a);
+    }
+  });
 }
 function _connectionSecurityError(message) {
   const node=document.getElementById('connection-security-error');
@@ -7345,6 +7372,7 @@ function _amuxAuthWithheldBanner() {
   bar.style.cssText='position:fixed;left:0;right:0;top:0;z-index:100000;min-height:44px;padding:calc(var(--space-3) + env(safe-area-inset-top,0px)) var(--space-3) var(--space-3);background:color-mix(in srgb, var(--red) 49%, var(--shade));color:var(--on-solid);font:14px system-ui;';
   bar.innerHTML='<b>Not signed in to this server.</b> Cached information may be stale. <button class="btn" onclick="_openConnectionSecurity(event)">Connection &amp; security · Sign in</button>';
   document.body.appendChild(bar);
+  _ssoOffer();
 }
 
 let _sessEtag = null;

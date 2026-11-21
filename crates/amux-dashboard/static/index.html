@@ -595,6 +595,10 @@ setTimeout(function(){document.documentElement.classList.remove('boot-home-pendi
         <section class="settings-section" id="connection-security">
           <details class="settings-fold"><summary class="settings-section-label">Connection &amp; security</summary>
           <p>These actions apply only to this server. Tokens and keys are never saved in the connection list.</p>
+          <div id="connection-sso" hidden>
+            <a class="btn" id="connection-sso-sign-in" href="/sso/login">Sign in with single sign-on</a>
+            <p class="connection-help">Team members: sign in with your work account. The owner token below is for the server owner only.</p>
+          </div>
           <pre id="connection-security-status">Open Connect to read active security status.</pre>
           <button class="btn" onclick="_connectionSecurityLoad()">Refresh security status</button>
           <p class="connection-help">Use <code>auth_token</code> from this server’s active Amux home. This is not a provider API key or invite token.</p>
