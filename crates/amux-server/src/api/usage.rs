@@ -1194,6 +1194,28 @@ async fn get_attribution(
 /// Spend by what started each turn (a person, a schedule, an amux nudge, a
 /// peer), over the last `hours`. Shared with /api/velocity/optimize so the
 /// Usage view and this endpoint show the same numbers.
+/// Spend per worker session over the last `hours`, straight from the token ledger: the whole population, not the
+/// top-10 of `attribution`. Used by the `usage_summary` MCP tool (the factory hub reads it every 15 minutes).
+/// Returns (total_cost_usd, [{session, cost_usd, turns}]) with at most 300 sessions, most expensive first.
+pub(crate) fn session_totals(conn: &rusqlite::Connection, hours: i64) -> anyhow::Result<(f64, Vec<Value>)> {
+    // token_ledger.ts is in SECONDS (see get_attribution).
+    let cutoff: i64 = chrono::Utc::now().timestamp() - hours * 3600;
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(session, ''), SUM(cost_usd), COUNT(*) FROM token_ledger WHERE ts > ?1 GROUP BY 1 ORDER BY 2 DESC",
+    )?;
+    let rows = stmt.query_map([cutoff], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, i64>(2)?)))?;
+    let (mut total, mut out) = (0.0f64, Vec::new());
+    for row in rows {
+        let (session, usd, turns) = row?;
+        total += usd;
+        if session.is_empty() || out.len() >= 300 {
+            continue;
+        }
+        out.push(json!({"session": session, "cost_usd": (usd * 1_000_000.0).round() / 1_000_000.0, "turns": turns}));
+    }
+    Ok(((total * 1_000_000.0).round() / 1_000_000.0, out))
+}
+
 pub(crate) fn attribution(conn: &rusqlite::Connection, hours: i64) -> anyhow::Result<Value> {
     {
         let cutoff: i64 = chrono::Utc::now().timestamp() - hours * 3600;

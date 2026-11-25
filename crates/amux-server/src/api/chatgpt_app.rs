@@ -1174,6 +1174,11 @@ pub(crate) fn tool_defs() -> Value {
             "session": {"type": "string", "description": "Worker that owns the card"},
             "status": {"type": "string", "enum": ["backlog", "todo"]}}},
          "annotations": rw},
+        {"name": "usage_summary", "title": "Usage summary",
+         "description": "Estimated spend of this amux over a window: total, per worker session (cost and turns), and the account's 7-day meter. Read-only. Only owner-approved connections (not member connections) may call it.",
+         "inputSchema": {"type": "object", "properties": {
+            "window_hours": {"type": "integer", "minimum": 1, "maximum": 720, "description": "Window in hours (default 24)"}}},
+         "annotations": ro},
         {"name": "update_card_status", "title": "Move a board card",
          "description": "Move a card to backlog, todo, doing or done. Board gates apply (done needs evidence); a refusal is returned as the board wrote it.",
          "inputSchema": {"type": "object", "required": ["id", "status"], "properties": {
@@ -1434,6 +1439,44 @@ async fn call_tool(state: &AppState, b: &Bearer, _base: &str, name: &str, args: 
             let now_status = after.get("status").cloned().unwrap_or(Value::Null);
             let landed = now_status.as_str() == Some(st.as_str());
             tool_result(json!({"status": code, "requested": st, "board_now_says": now_status, "landed": landed}), !landed)
+        }
+        "usage_summary" => {
+            // Spend is an owner view: a member connection never reads it.
+            if b.member.is_some() {
+                return tool_err("usage_summary is available only to owner-approved connections");
+            }
+            let hours = match args.get("window_hours") {
+                None | Some(Value::Null) => 24,
+                Some(v) => match v.as_i64() {
+                    Some(h) if (1..=720).contains(&h) => h,
+                    _ => return tool_err("window_hours must be an integer from 1 to 720"),
+                },
+            };
+            let store = state.store.clone();
+            let ledger = tokio::task::spawn_blocking(move || -> anyhow::Result<(f64, Vec<Value>)> {
+                let conn = store.read()?;
+                super::usage::session_totals(&conn, hours)
+            })
+            .await;
+            let (total, workers) = match ledger {
+                Ok(Ok(v)) => v,
+                _ => return tool_err("the usage ledger could not be read"),
+            };
+            let (code, u) = local(state, who, g, reqwest::Method::GET, "/api/usage", None).await;
+            let week = if code == 200 { u.get("seven_day").cloned().unwrap_or(Value::Null) } else { Value::Null };
+            let percent = week.get("utilization").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 1000.0);
+            let resets_at = week
+                .get("resets_at")
+                .and_then(Value::as_str)
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string());
+            tool_result(json!({
+                "window_hours": hours,
+                "window_end": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                "total_cost_usd": total,
+                "workers": workers,
+                "meter": {"percent_used": percent, "resets_at": resets_at},
+            }), false)
         }
         other => tool_err(&format!("unknown tool {other}")),
     }
@@ -1771,7 +1814,7 @@ mod tests {
         assert_eq!(init["result"]["serverInfo"]["name"], "amux");
         let (_, _, tl) = call(&a, rpc("tools/list", Some(at))).await;
         let names: Vec<&str> = tl["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["list_workers", "read_worker", "message_worker", "list_board", "add_card", "update_card_status"]);
+        assert_eq!(names, ["list_workers", "read_worker", "message_worker", "list_board", "add_card", "usage_summary", "update_card_status"]);
         for t in tl["result"]["tools"].as_array().unwrap() {
             assert_eq!(t["annotations"]["destructiveHint"], false, "no destructive tool ships");
             assert_eq!(t["annotations"]["readOnlyHint"], !write_tool(t["name"].as_str().unwrap()));
